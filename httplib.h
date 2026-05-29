@@ -3069,7 +3069,10 @@ protected:
   size_t socket_requests_in_flight_ = 0;
   std::thread::id socket_requests_are_from_thread_ = std::thread::id();
   bool socket_should_be_closed_when_request_is_done_ = false;
-  size_t socket_tls_settings_version_ = 0;
+  // Set to the transferred socket while open_stream() owns it and may block
+  // before returning. Stores the socket value rather than a StreamHandle
+  // pointer so stop() remains valid if the local handle is moved on return.
+  socket_t current_stream_socket_ = INVALID_SOCKET;
 
   // Set by stop() while a request is in flight. The request's reads poll it,
   // because shutting the socket down does not wake a read on Windows.
@@ -16016,7 +16019,19 @@ inline ClientImpl::StreamHandle ClientImpl::open_stream_(Request &req) {
     }
 
     transfer_socket_ownership_to_handle(handle);
+    // Expose the socket while we block reading response headers so that
+    // stop() can reach the socket even though socket_ is now invalid.
+    current_stream_socket_ = handle.connection_->sock;
   }
+
+  // Clear current_stream_socket_ on every exit path (success or failure).
+  struct AutoClearStreamSocket {
+    ClientImpl &impl;
+    ~AutoClearStreamSocket() {
+      std::lock_guard<std::mutex> g(impl.socket_mutex_);
+      impl.current_stream_socket_ = INVALID_SOCKET;
+    }
+  } auto_clear{*this};
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
   if (is_ssl() && handle.connection_->session) {
@@ -18104,6 +18119,14 @@ inline void ClientImpl::stop() {
     // request's reads also give up once they see this flag.
     stop_requested_ = true;
 
+    // If open_stream() transferred the socket to a StreamHandle and is
+    // currently blocked reading response headers, socket_ is already
+    // INVALID_SOCKET so shutdown_socket above was a no-op.  Shut down the
+    // transferred socket directly instead.
+    if (current_stream_socket_ != INVALID_SOCKET) {
+      detail::shutdown_socket(current_stream_socket_);
+    }
+
     // Aside from that, we set a flag for the socket to be closed when we're
     // done.
     socket_should_be_closed_when_request_is_done_ = true;
@@ -18111,6 +18134,20 @@ inline void ClientImpl::stop() {
   }
 
   disconnect(/*gracefully=*/true);
+
+  // open_stream() does NOT increment socket_requests_in_flight_, so the branch
+  // above won't fire even when open_stream() is blocking in the header-read
+  // phase.  Check current_stream_socket_ explicitly here.
+  if (current_stream_socket_ != INVALID_SOCKET) {
+    detail::shutdown_socket(current_stream_socket_);
+    socket_should_be_closed_when_request_is_done_ = true;
+    return;
+  }
+
+  // Otherwise, still holding the mutex, we can shut everything down ourselves
+  shutdown_ssl(socket_, true);
+  shutdown_socket(socket_);
+  close_socket(socket_);
 }
 
 inline std::string ClientImpl::host() const { return host_; }
