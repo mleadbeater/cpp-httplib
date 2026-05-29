@@ -2794,6 +2794,19 @@ public:
     Error get_read_error() const { return body_reader_.last_error; }
     bool has_read_error() const { return body_reader_.has_error(); }
 
+    // Interrupt a blocking read() call by shutting down the underlying socket.
+    // Safe to call from another thread while read() is in progress, provided
+    // this StreamHandle is not concurrently moved or destroyed.
+    void stop() noexcept {
+      if (connection_ && connection_->sock != INVALID_SOCKET) {
+#ifdef _WIN32
+        ::shutdown(connection_->sock, SD_BOTH);
+#else
+        ::shutdown(connection_->sock, SHUT_RDWR);
+#endif
+      }
+    }
+
     bool trailers_parsed_ = false;
 
   private:
@@ -4228,6 +4241,11 @@ public:
   size_t size() const;
   std::string read_all();
 
+  // Interrupt a blocking next() call by shutting down the underlying socket.
+  // Safe to call from another thread while next() is in progress, provided
+  // this Result is not concurrently moved or destroyed.
+  void stop() noexcept;
+
 private:
   ClientImpl::StreamHandle handle_;
   std::string buffer_;
@@ -5011,6 +5029,8 @@ inline std::string Result::read_all() {
   }
   return result;
 }
+
+inline void Result::stop() noexcept { handle_.stop(); }
 
 } // namespace stream
 
