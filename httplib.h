@@ -17050,13 +17050,7 @@ inline void ClientImpl::stop() {
   if (current_stream_socket_ != INVALID_SOCKET) {
     detail::shutdown_socket(current_stream_socket_);
     socket_should_be_closed_when_request_is_done_ = true;
-    return;
   }
-
-  // Otherwise, still holding the mutex, we can shut everything down ourselves
-  shutdown_ssl(socket_, true);
-  shutdown_socket(socket_);
-  close_socket(socket_);
 }
 
 inline std::string ClientImpl::host() const { return host_; }
