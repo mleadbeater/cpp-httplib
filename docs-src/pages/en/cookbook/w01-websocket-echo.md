@@ -1,6 +1,6 @@
 ---
 title: "W01. Implement a WebSocket Echo Server and Client"
-order: 51
+order: 52
 status: "draft"
 ---
 
@@ -36,6 +36,7 @@ The `read()` return value is a `ReadResult` enum:
 - `ReadResult::Text`: received a text message
 - `ReadResult::Binary`: received a binary message
 - `ReadResult::Fail`: error, or connection closed
+- `ReadResult::Timeout`: the read timeout elapsed with nothing received; the connection is still open. Only appears once a read timeout is set — see [W06. Set Timeouts](../w06-websocket-timeouts)
 
 ## Client: talk to the echo server
 
@@ -71,7 +72,7 @@ ws.send("Hello");                        // text frame
 ws.send(binary_data, binary_data_size);  // binary frame
 ```
 
-The `std::string` overload sends as **text**; the `const char*` + size overload sends as **binary**. A bit subtle, but once you know it, it's intuitive. See [W04. Send and receive binary frames](w04-websocket-binary) for details.
+The `std::string` overload sends as **text**; the `const char*` + size overload sends as **binary**. A bit subtle, but once you know it, it's intuitive. See [W04. Send and receive binary frames](../w04-websocket-binary) for details.
 
 ## Thread pool implications
 
@@ -83,6 +84,6 @@ svr.new_task_queue = [] {
 };
 ```
 
-See [S21. Configure the thread pool](s21-thread-pool).
+See [S21. Configure the thread pool](../s21-thread-pool).
 
-> **Note:** To run WebSocket over HTTPS, use `httplib::SSLServer` instead of `httplib::Server` — the same `WebSocket()` handler just works. On the client side, use a `wss://` URL.
+> **Note:** To run WebSocket over HTTPS, use `httplib::SSLServer` instead of `httplib::Server` — the same `WebSocket()` handler just works. On the client side, use a `wss://` URL. For CA and client certificate configuration, see [W05. Configure TLS for wss:// Connections](../w05-websocket-tls).

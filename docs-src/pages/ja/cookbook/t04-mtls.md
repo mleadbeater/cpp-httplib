@@ -1,6 +1,6 @@
 ---
 title: "T04. mTLSを設定する"
-order: 45
+order: 46
 status: "draft"
 ---
 
@@ -57,9 +57,25 @@ auto res = cli.Get("/");
 
 `Client`ではなく`SSLClient`を直接使う点に注意してください。秘密鍵にパスワードがある場合は第5引数で渡せます。
 
+クライアント側にも同じ`PemMemory`構造体があり、メモリ上のPEMからクライアント証明書を設定できます。
+
+```cpp
+httplib::SSLClient::PemMemory pem{};
+pem.cert_pem = client_cert.data();
+pem.cert_pem_len = client_cert.size();
+pem.key_pem = client_key.data();
+pem.key_pem_len = client_key.size();
+
+httplib::SSLClient cli("api.example.com", 443, pem);
+
+auto res = cli.Get("/");
+```
+
+> WebSocketクライアント（`wss://`）でmTLSを使う場合は[W05. wss接続でTLSを設定する](../w05-websocket-tls)を参照してください。
+
 ## ハンドラからクライアント情報を取得する
 
-ハンドラの中で、どのクライアントが接続してきたかを確認したいときは`req.peer_cert()`を使います。詳しくは[T05. サーバー側でピア証明書を参照する](t05-peer-cert)を参照してください。
+ハンドラの中で、どのクライアントが接続してきたかを確認したいときは`req.peer_cert()`を使います。詳しくは[T05. サーバー側でピア証明書を参照する](../t05-peer-cert)を参照してください。
 
 ## 用途
 

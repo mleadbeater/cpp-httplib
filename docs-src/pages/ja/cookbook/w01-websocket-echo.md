@@ -1,6 +1,6 @@
 ---
 title: "W01. WebSocketエコーサーバー／クライアントを実装する"
-order: 51
+order: 52
 status: "draft"
 ---
 
@@ -31,11 +31,12 @@ int main() {
 
 `svr.WebSocket()`でWebSocket用のハンドラを登録します。ハンドラが呼ばれた時点で、すでにWebSocketのハンドシェイクは完了しています。ループの中で`ws.read()`して`ws.send()`するだけで、エコー動作が完成します。
 
-`read()`の返り値は`ReadResult`列挙値で、次の3種類です。
+`read()`の返り値は`ReadResult`列挙値で、次の4種類です。
 
 - `ReadResult::Text`: テキストメッセージを受信
 - `ReadResult::Binary`: バイナリメッセージを受信
 - `ReadResult::Fail`: エラー、または接続が閉じた
+- `ReadResult::Timeout`: 何も受信しないまま読み取りタイムアウトが経過した。接続は開いたまま。読み取りタイムアウトを設定したときだけ返る（[W06. タイムアウトを設定する](../w06-websocket-timeouts)を参照）
 
 ## クライアント: エコーを叩く
 
@@ -71,7 +72,7 @@ ws.send("Hello");                        // テキストフレーム
 ws.send(binary_data, binary_data_size);  // バイナリフレーム
 ```
 
-`std::string`を受け取るオーバーロードはテキスト、`const char*`とサイズを受け取るオーバーロードはバイナリとして送られます。詳しくは[W04. バイナリフレームを送受信する](w04-websocket-binary)を参照してください。
+`std::string`を受け取るオーバーロードはテキスト、`const char*`とサイズを受け取るオーバーロードはバイナリとして送られます。詳しくは[W04. バイナリフレームを送受信する](../w04-websocket-binary)を参照してください。
 
 ## スレッドとの関係
 
@@ -83,6 +84,6 @@ svr.new_task_queue = [] {
 };
 ```
 
-詳細は[S21. マルチスレッド数を設定する](s21-thread-pool)を参照してください。
+詳細は[S21. マルチスレッド数を設定する](../s21-thread-pool)を参照してください。
 
-> **Note:** HTTPSサーバーの上でWebSocketを動かしたいときは、`httplib::Server`の代わりに`httplib::SSLServer`を使えば、同じ`WebSocket()`ハンドラがそのまま動きます。クライアント側は`wss://`スキームを指定するだけです。
+> **Note:** HTTPSサーバーの上でWebSocketを動かしたいときは、`httplib::Server`の代わりに`httplib::SSLServer`を使えば、同じ`WebSocket()`ハンドラがそのまま動きます。クライアント側は`wss://`スキームを指定するだけです。CA証明書やクライアント証明書の設定は[W05. wss接続でTLSを設定する](../w05-websocket-tls)を参照してください。

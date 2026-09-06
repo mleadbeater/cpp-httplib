@@ -67,7 +67,7 @@ cpp-httplib supports multiple TLS backends through an abstraction layer:
 | Backend | Define | Libraries | Notes |
 | :------ | :----- | :-------- | :---- |
 | OpenSSL | `CPPHTTPLIB_OPENSSL_SUPPORT` | `libssl`, `libcrypto` | [3.0 or later](https://www.openssl.org/policies/releasestrat.html) required |
-| Mbed TLS | `CPPHTTPLIB_MBEDTLS_SUPPORT` | `libmbedtls`, `libmbedx509`, `libmbedcrypto` | 2.x and 3.x supported (auto-detected) |
+| Mbed TLS | `CPPHTTPLIB_MBEDTLS_SUPPORT` | `libmbedtls`, `libmbedx509`, `libmbedcrypto` | 2.x, 3.x, and 4.x supported (auto-detected); 4.x renames `libmbedcrypto` to `libtfpsacrypto` |
 | wolfSSL | `CPPHTTPLIB_WOLFSSL_SUPPORT` | `libwolfssl` | 5.x supported; must build with `--enable-opensslall` |
 
 > [!NOTE]
@@ -167,6 +167,41 @@ cli.set_server_certificate_verifier(
       return ctx.preverify_ok;
     });
 ```
+
+### Mutual TLS (mTLS)
+
+Regular TLS only verifies the server certificate. With mTLS, the client also presents a certificate that the server verifies.
+
+```c++
+// Server: pass a CA to verify client certificates against
+httplib::SSLServer svr("./cert.pem", "./key.pem", "./client-ca-cert.pem");
+
+// Client: present a certificate
+httplib::SSLClient cli("api.example.com", 443,
+                       "./client-cert.pem", "./client-key.pem");
+```
+
+Both `SSLServer` and `SSLClient` also accept an in-memory `PemMemory` struct instead of file paths — handy when certs come from an environment variable or a secrets manager:
+
+```c++
+httplib::SSLServer::PemMemory server_pem{};
+server_pem.cert_pem = server_cert.data();
+server_pem.cert_pem_len = server_cert.size();
+server_pem.key_pem = server_key.data();
+server_pem.key_pem_len = server_key.size();
+server_pem.client_ca_pem = client_ca.data();
+server_pem.client_ca_pem_len = client_ca.size();
+httplib::SSLServer svr(server_pem);
+
+httplib::SSLClient::PemMemory client_pem{};
+client_pem.cert_pem = client_cert.data();
+client_pem.cert_pem_len = client_cert.size();
+client_pem.key_pem = client_key.data();
+client_pem.key_pem_len = client_key.size();
+httplib::SSLClient cli("api.example.com", 443, client_pem);
+```
+
+`httplib::ws::WebSocketClient` has the same `PemMemory` constructor for `wss://` connections. See [README-websocket.md](README-websocket.md) for details.
 
 ### Peer Certificate Inspection
 
@@ -271,6 +306,39 @@ int main(void)
 ```
 
 `Post`, `Put`, `Patch`, `Delete` and `Options` methods are also supported.
+
+### Custom HTTP methods
+
+Methods outside the built-in set are rejected with `400 Bad Request` unless a handler is registered for them with `CustomRoute`. This covers the WebDAV methods of RFC 4918, `SUBSCRIBE` and friends from UPnP, and any other extension method.
+
+```c++
+svr.CustomRoute("PROPFIND", "/dav/:id", [](const Request& req, Response& res) {
+  // The request body is available as usual
+  auto id = req.path_params.at("id");
+  res.status = StatusCode::MultiStatus_207;
+  res.set_content(build_multistatus(req.body), "application/xml");
+});
+
+// A content reader overload is available too
+svr.CustomRoute("REPORT", "/dav/.*",
+                [](const Request& req, Response& res,
+                   const ContentReader& content_reader) {
+                  content_reader([&](const char* data, size_t data_length) {
+                    // ...
+                    return true;
+                  });
+                });
+```
+
+Patterns work exactly as they do for `Get` and the other methods, so regular expressions and path parameters are both available.
+
+Note the following:
+
+* The method name must be a valid HTTP method token (RFC 9110) and must be registered before `listen()` is called.
+* `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `CONNECT`, `OPTIONS`, `TRACE`, `PATCH` and `PRI` cannot be registered this way. Use the dedicated methods above instead.
+* A rejected registration makes `is_valid()` return `false`, and `listen()` then fails rather than starting a server with a route that would never fire.
+* Static file serving and WebSocket upgrades remain `GET`/`HEAD` only.
+* `Allow` and the WebDAV `DAV:` header are not generated automatically. Register an `Options` handler if clients need them.
 
 ### Bind a socket to multiple interfaces and any available port
 
@@ -379,6 +447,8 @@ svr.set_pre_compression_logger([](const httplib::Request& req, const httplib::Re
 
 The pre-compression logger is only called when compression would be applied. For responses without compression, only the access logger is called.
 
+For a static file response (see [Static file compression](#static-file-compression)), `res.body` is empty when the logger runs. The bytes are still on disk at that point, not in memory.
+
 #### Error Logging
 
 Error loggers capture failed requests and connection issues. Unlike access loggers, error loggers only receive the Error and Request information, as errors typically occur before a meaningful Response can be generated.
@@ -450,6 +520,8 @@ svr.set_post_routing_handler([](const auto& req, auto& res) {
 
 ### Pre request handler
 
+The pre-request handler runs after the route has been matched (so `req.matched_route` and `req.path_params` are available) but **before the request body is read**. This means you can reject a request — for example on a failed authentication or authorization check — without forcing the server to buffer a potentially large body.
+
 ```cpp
 svr.set_pre_request_handler([](const auto& req, auto& res) {
   if (req.matched_route == "/user/:user") {
@@ -463,6 +535,38 @@ svr.set_pre_request_handler([](const auto& req, auto& res) {
   return Server::HandlerResponse::Unhandled;
 });
 ```
+
+> [!NOTE]
+> Because the body has not been read yet, `req.body` and form fields parsed from the body are not available in the pre-request handler. Inspect headers, the path, query parameters, or `req.matched_route` instead.
+
+### Handler execution order
+
+`set_start_handler` runs once when the server starts. For each request, handlers run in the following order:
+
+```
+Request received
+  │
+  ├─ pre_routing_handler          route not matched yet, body not read
+  │     └─ returns Handled → stop here
+  │
+  ├─ file_request_handler         (GET/HEAD, static file serving)
+  │
+  ├─ expect_100_continue_handler  (when the request has "Expect: 100-continue")
+  │
+  ├─ route matching → req.matched_route is set
+  │
+  ├─ pre_request_handler          route matched, body NOT read yet
+  │     └─ returns Handled → stop here (route handler is skipped)
+  │
+  ├─ route handler                Get/Post/...; the request body is read first
+  │
+  └─ post_routing_handler         after routing completes
+
+  On a thrown exception → exception_handler
+  On an error status (4xx/5xx) → error_handler
+```
+
+Use `pre_routing_handler` to reject a request as early as possible, before the route is known. Use `pre_request_handler` for route-specific checks, since `req.matched_route` is available and the body has not been read yet.
 
 ### Response user data
 
@@ -625,6 +729,12 @@ svr.Post("/content_receiver",
     }
   });
 ```
+
+`CPPHTTPLIB_MULTIPART_FORM_DATA_FILE_MAX_COUNT` (default 1024) caps the number of
+form-data parts only on the buffered path, where every part is accumulated into
+`req.form`. The content receiver keeps nothing, so the cap does not apply here.
+If your handler needs an upper bound on the number of parts, count them yourself
+and return `false` from the callback to stop the parser.
 
 ### Send content with the content provider
 
@@ -790,6 +900,15 @@ svr.new_task_queue = [] { return new ThreadPool(/*base_threads=*/12, /*max_threa
 Default limit is 0 (unlimited). Once the limit is reached, the listener
 will shutdown the client connection.
 
+#### Idle timeout for dynamic threads
+
+The idle timeout for dynamic threads can also be set at runtime via the
+fourth parameter (in seconds):
+
+```cpp
+svr.new_task_queue = [] { return new ThreadPool(/*base_threads=*/8, /*max_threads=*/64, /*max_queued_requests=*/0, /*idle_timeout_sec=*/10); };
+```
+
 ### Override the default thread pool with yours
 
 You can supply your own thread pool implementation according to your need.
@@ -893,6 +1012,7 @@ enum class Error {
   UnsupportedAddressFamily,
   HTTPParsing,
   InvalidRangeHeader,
+  UnsupportedContentEncoding,
 };
 ```
 
@@ -953,7 +1073,7 @@ auto res = cli.Get("/hi", headers);
 or
 
 ```c++
-auto res = cli.Get("/hi", {{"Hello", "World!"}});
+auto res = cli.Get("/hi", httplib::Headers{{"Hello", "World!"}});
 ```
 
 or
@@ -1197,7 +1317,7 @@ for details and for reading the variable from the environment.
 ```cpp
 httplib::Client cli("httpcan.org");
 
-auto res = cli.Get("/range/32", {
+auto res = cli.Get("/range/32", httplib::Headers{
   httplib::make_range_header({{1, 10}}) // 'Range: bytes=1-10'
 });
 // res->status should be 206.
@@ -1246,6 +1366,36 @@ res->status; // 200
 cli.set_interface("eth0"); // Interface name, IP address or host name
 ```
 
+The same method is available on `httplib::ws::WebSocketClient`.
+
+### Override the connection target for a hostname
+
+`set_hostname_addr_map` redirects where the socket connects, without changing
+the identity of the request. The hostname the client was constructed with keeps
+supplying the `Host` header, the SNI, and the name that the server certificate
+is verified against, so this is a connection-level override only, not a way to
+talk to a different origin.
+
+```cpp
+httplib::Client cli("https://example.com");
+
+// Connect to this IP address instead of resolving "example.com"
+cli.set_hostname_addr_map({{"example.com", "192.168.1.10"}});
+```
+
+A mapped value may be an IP literal or another hostname. An IP literal is used
+as-is; anything else is resolved as a name, so a host that is only reachable
+under a different name works too:
+
+```cpp
+cli.set_hostname_addr_map({{"example.com", "internal.example.lan"}});
+```
+
+An empty value is ignored, leaving the original hostname as the connection
+target.
+
+The same method is available on `httplib::ws::WebSocketClient`.
+
 ### Automatic Path Encoding
 
 The client automatically encodes special characters in URL paths by default:
@@ -1285,6 +1435,29 @@ httplib::Server svr;
 svr.listen("127.0.0.1", 8080);
 ```
 
+## Ordered Headers, Query Parameters, and Form Data
+
+`Headers`, `Params`, `FormFields`, and `FormFiles` preserve the order entries were received (for a parsed request) or inserted (for one you build yourself). Earlier versions stored these in `std::multimap` or `std::unordered_multimap`, which either sorted entries by key or gave no ordering guarantee at all for repeated keys. RFC 9110 §5.3 and RFC 7578 §5.2 both require the original order to be preserved, so this is now guaranteed rather than incidental.
+
+```c++
+// A request with two Accept-Encoding lines...
+// Accept-Encoding: gzip
+// Accept-Encoding: br
+// ...visits "gzip" before "br", not the other way around.
+for (auto it = req.headers.equal_range("Accept-Encoding").first;
+     it != req.headers.end(); ++it) {
+  std::cout << it->second << std::endl;
+}
+
+// get_header_value(key, id) reaches a specific one directly.
+auto second = req.get_header_value("Accept-Encoding", 1); // "br"
+```
+
+`Headers` matches field names case-insensitively, as before. `Params`, `FormFields`, and `FormFiles` are case-sensitive.
+
+> [!NOTE]
+> Iterators on these containers follow `std::vector` rules: inserting a new entry invalidates existing iterators. Code that keeps an iterator across a call to `insert()`/`emplace()` needs to re-fetch it afterward.
+
 ## Payload Limit
 
 The maximum payload body size is limited to 100MB by default for both server and client. You can change it with `set_payload_max_length()` or by defining `CPPHTTPLIB_PAYLOAD_MAX_LENGTH` at compile time. Setting it to `0` disables the limit entirely.
@@ -1300,6 +1473,45 @@ The server can apply compression to the following MIME type contents:
 - application/xml
 - application/protobuf
 - application/xhtml+xml
+
+A response that already carries `Content-Encoding` is sent as it is. A handler serving content it encoded itself, an asset compressed at build time for instance, keeps its own coding and its own bytes:
+
+```c++
+svr.Get("/app.js", [](const Request & /*req*/, Response &res) {
+  res.set_header("Content-Encoding", "gzip");
+  res.set_content(gzipped_asset, "application/javascript");
+});
+```
+
+This holds for every kind of response, including the file-backed ones below.
+
+`Vary: Accept-Encoding` is added only to responses the server encoded itself. A handler that chooses between an encoded and an identity representation by reading `Accept-Encoding` should set the field itself, so that shared caches keep the two apart.
+
+### Static file compression
+
+Responses served from a file, whether through `set_mount_point()` or `Response::set_file_content()`, are sent as is by default. Turn compression on for them with:
+
+```c++
+svr.set_static_file_compression(true);
+```
+
+Only files within a size range are compressed, and both ends of it can be moved:
+
+```c++
+svr.set_static_file_compression_min_length(512);
+svr.set_static_file_compression_max_length(1024 * 1024);
+```
+
+The lower bound defaults to 1400 bytes. A response that already fits in a single 1500-byte MTU is not delivered any faster for being smaller, and a file of a few bytes comes back larger than it went in, since gzip's header and trailer outweigh what deflate saves. `0` compresses everything down to a single byte, and `CPPHTTPLIB_STATIC_FILE_COMPRESSION_MIN_LENGTH` sets the default at compile time. An empty file is never compressed regardless.
+
+The upper bound defaults to 4MB, and exists for a different reason: the file is compressed per request, and the compressed bytes are held in memory until the response has been written, so the peak cost scales with the number of requests in flight. It is a bound on what one request can cost, not a statement about how well large files compress, which is why raising it is reasonable when the files are known and the traffic is not. `0` removes the limit, and `CPPHTTPLIB_STATIC_FILE_COMPRESSION_MAX_LENGTH` sets the default at compile time.
+
+A compressed response keeps its `Content-Length`, so `HEAD` still reports the size a `GET` would return. Two details are worth knowing:
+
+- Range requests are answered from the uncompressed representation, so `Content-Range` keeps naming the file's own bytes.
+- The `ETag` carries the coding it belongs to (`W/"...-gzip"`), so a client that cached the compressed form revalidates against the right validator.
+
+Content providers registered with `set_content_provider()` are not covered. Feeding one through a compressor would hold each write back until the compressor's window filled, which breaks providers that produce their body incrementally. Use `set_chunked_content_provider()` to compress a generated body.
 
 ### Zlib Support
 
@@ -1321,13 +1533,13 @@ The default `Accept-Encoding` value contains all possible compression types. So,
 
 ```c++
 res = cli.Get("/resource/foo");
-res = cli.Get("/resource/foo", {{"Accept-Encoding", "br, gzip, deflate, zstd"}});
+res = cli.Get("/resource/foo", httplib::Headers{{"Accept-Encoding", "br, gzip, deflate, zstd"}});
 ```
 
 If we don't want a response without compression, we have to set `Accept-Encoding` to an empty string. This behavior is similar to curl.
 
 ```c++
-res = cli.Get("/resource/foo", {{"Accept-Encoding", ""}});
+res = cli.Get("/resource/foo", httplib::Headers{{"Accept-Encoding", ""}});
 ```
 
 ### Compress request body on client
@@ -1349,7 +1561,6 @@ res->body; // Compressed data
 Unix Domain Socket Support
 --------------------------
 
-Unix Domain Socket support is available on Linux and macOS.
 
 ```c++
 // Server
@@ -1447,11 +1658,9 @@ See [README-sse.md](README-sse.md) for more details.
 httplib::Server svr;
 
 svr.WebSocket("/ws", [](const httplib::Request &req, httplib::ws::WebSocket &ws) {
-    httplib::ws::Message msg;
+    std::string msg;
     while (ws.read(msg)) {
-        if (msg.is_text()) {
-            ws.send("Echo: " + msg.data);
-        }
+        ws.send("Echo: " + msg);
     }
 });
 

@@ -4,7 +4,7 @@ order: 20
 status: "draft"
 ---
 
-`httplib::Server`では、HTTPメソッドごとにハンドラを登録します。`Get()`、`Post()`、`Put()`、`Delete()`の各メソッドにパターンとラムダを渡すだけです。
+`httplib::Server`では、HTTPメソッドごとにハンドラを登録します。`Get()`、`Post()`、`Put()`、`Delete()`の各メソッドにパターンとラムダを渡すだけです。WebDAVの`PROPFIND`のような組み込み以外のメソッドを扱いたいときは、`CustomRoute()`を使います。
 
 ## 基本の使い方
 
@@ -61,6 +61,8 @@ svr.Get("/me", [](const httplib::Request &req, httplib::Response &res) {
 
 レスポンスヘッダーを追加したいときは`res.set_header("Name", "Value")`です。
 
-> **Note:** `listen()`はブロックする関数です。別スレッドで動かしたいときは`std::thread`で包むか、ノンブロッキング起動が必要なら[S18. `listen_after_bind`で起動順序を制御する](s18-listen-after-bind)を参照してください。
+> **Note:** `listen()`はブロックする関数です。別スレッドで動かしたいときは`std::thread`で包むか、ノンブロッキング起動が必要なら[S18. `listen_after_bind`で起動順序を制御する](../s18-listen-after-bind)を参照してください。
 
-> パスパラメーター（`/users/:id`）を使いたい場合は[S03. パスパラメーターを使う](s03-path-params)を参照してください。
+> パスパラメーター（`/users/:id`）を使いたい場合は[S03. パスパラメーターを使う](../s03-path-params)を参照してください。
+
+> WebDAVの`PROPFIND`のような組み込み以外のメソッドは[S23. カスタムHTTPメソッドを扱う](../s23-custom-methods)を参照してください。

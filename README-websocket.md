@@ -57,13 +57,29 @@ if (ws.connect()) {
 
 ```cpp
 enum ReadResult : int {
-    Fail   = 0,  // Connection closed or error
-    Text   = 1,  // UTF-8 text message
-    Binary = 2,  // Binary message
+    Fail    = 0,  // Connection closed or error
+    Text    = 1,  // UTF-8 text message
+    Binary  = 2,  // Binary message
+    Timeout = 3,  // Read timeout elapsed; connection still open
 };
 ```
 
 Returned by `read()`. Since `Fail` is `0`, the result works naturally in boolean contexts — `while (ws.read(msg))` continues until the connection closes. When you need to distinguish text from binary, check the return value directly.
+
+`Timeout` only appears once a read timeout is in effect (a client waits forever unless you set one; a server uses `CPPHTTPLIB_WEBSOCKET_SERVER_READ_TIMEOUT_SECOND`). It means the timeout elapsed on a message boundary: nothing was consumed and the connection is still open, so you can send on it and read again.
+
+**`msg` is left untouched on `Timeout`.** Because `Timeout` is non-zero, `while (ws.read(msg))` keeps looping — with the *previous* message still in `msg`. Once a read timeout is set, test the result instead:
+
+```cpp
+ws.set_read_timeout(std::chrono::milliseconds(100));
+std::string msg;
+while (ws.is_open()) {
+    auto r = ws.read(msg);
+    if (r == httplib::ws::Timeout) { continue; }  // nothing yet; send if you like
+    if (r == httplib::ws::Fail) { break; }
+    handle(msg);
+}
+```
 
 ### CloseStatus
 
@@ -135,11 +151,31 @@ bool is_open() const;
 explicit WebSocketClient(const std::string &scheme_host_port_path,
                          const Headers &headers = {});
 
+// Constructor with a client certificate for mutual TLS (wss:// only,
+// requires CPPHTTPLIB_OPENSSL_SUPPORT). The certificate is ignored for
+// ws:// URLs.
+struct PemMemory {
+  const char *cert_pem;
+  size_t cert_pem_len;
+  const char *key_pem;
+  size_t key_pem_len;
+  const char *private_key_password;
+};
+explicit WebSocketClient(const std::string &scheme_host_port_path,
+                         const PemMemory &pem, const Headers &headers = {});
+
 // Check if the URL was parsed successfully
 bool is_valid() const;
 
-// Connect (performs HTTP upgrade handshake)
-bool connect();
+// Connect (performs HTTP upgrade handshake). The returned Result is truthy
+// only when the handshake fully succeeded; on failure it describes what went
+// wrong:
+//   res.error()             httplib::Error identifying the failing layer
+//   res.status()            HTTP status of the upgrade response (-1 if none)
+//   res.headers()           headers of the upgrade response
+//   res.ssl_error()         TLS error detail (wss://, SSL builds only)
+//   res.ssl_backend_error() backend-specific TLS error code (SSL builds only)
+Result connect();
 
 // Get the subprotocol selected by the server (empty if none)
 const std::string &subprotocol() const;
@@ -155,11 +191,20 @@ bool is_open() const;
 // Timeouts
 void set_read_timeout(time_t sec, time_t usec = 0);
 void set_write_timeout(time_t sec, time_t usec = 0);
+void set_connection_timeout(time_t sec, time_t usec = 0);
+template <class Rep, class Period>
+void set_read_timeout(const std::chrono::duration<Rep, Period> &duration);
+template <class Rep, class Period>
+void set_write_timeout(const std::chrono::duration<Rep, Period> &duration);
+template <class Rep, class Period>
+void set_connection_timeout(const std::chrono::duration<Rep, Period> &duration);
 
 // SSL configuration (wss:// only, requires CPPHTTPLIB_OPENSSL_SUPPORT)
-void set_ca_cert_path(const std::string &path);
+void set_ca_cert_path(const std::string &ca_cert_file_path,
+                      const std::string &ca_cert_dir_path = std::string());
 void set_ca_cert_store(tls::ca_store_t store);
 void enable_server_certificate_verification(bool enabled);
+void enable_server_hostname_verification(bool enabled);
 ```
 
 ## Examples
@@ -197,6 +242,26 @@ if (ws.connect()) {
         std::cout << msg << std::endl; // "echo: hello", "echo: world"
     }
     // read() returns false when the server closes the connection
+}
+```
+
+### Inspecting Connection Failures
+
+`connect()` returns a `Result` that tells you why a connection attempt failed.
+`error()` distinguishes network problems (`Connection`, `ConnectionTimeout`),
+TLS problems (`SSLConnection`, `SSLServerVerification`,
+`SSLServerHostnameVerification`), and upgrade rejections
+(`WebSocketHandshake`). When the server answered with something other than
+`101 Switching Protocols`, `status()` and `headers()` carry that response:
+
+```cpp
+auto res = ws.connect();
+if (!res) {
+    std::cerr << "connect failed: " << httplib::to_string(res.error()) << std::endl;
+    if (res.status() != -1) {
+        // The server responded but refused the upgrade (e.g. 401, 404)
+        std::cerr << "HTTP status: " << res.status() << std::endl;
+    }
 }
 ```
 
@@ -286,8 +351,14 @@ httplib::Headers headers = {
 };
 
 httplib::ws::WebSocketClient ws("ws://localhost:8080/ws", headers);
-ws.set_read_timeout(30, 0);   // 30 seconds
-ws.set_write_timeout(10, 0);  // 10 seconds
+ws.set_connection_timeout(5, 0); // 5 seconds
+ws.set_read_timeout(30, 0);      // 30 seconds
+ws.set_write_timeout(10, 0);     // 10 seconds
+
+// std::chrono is also supported
+ws.set_connection_timeout(std::chrono::seconds(5));
+ws.set_read_timeout(std::chrono::seconds(30));
+ws.set_write_timeout(std::chrono::seconds(10));
 
 if (ws.connect()) {
     std::string msg;
@@ -341,6 +412,7 @@ if (ws.connect()) {
 httplib::ws::WebSocketClient ws("wss://example.com/ws");
 ws.set_ca_cert_path("/path/to/ca-bundle.crt");
 ws.enable_server_certificate_verification(true);
+ws.enable_server_hostname_verification(true); // default; false skips the identity check
 
 if (ws.connect()) {
     ws.send("secure message");
@@ -353,7 +425,8 @@ if (ws.connect()) {
 | Macro                                       | Default           | Description                                              |
 |---------------------------------------------|-------------------|----------------------------------------------------------|
 | `CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH`   | `16777216` (16MB) | Maximum payload size per message                         |
-| `CPPHTTPLIB_WEBSOCKET_READ_TIMEOUT_SECOND`  | `300`             | Read timeout for WebSocket connections (seconds)         |
+| `CPPHTTPLIB_WEBSOCKET_CLIENT_READ_TIMEOUT_SECOND` | `0`         | Client read timeout (seconds); `0` waits forever         |
+| `CPPHTTPLIB_WEBSOCKET_SERVER_READ_TIMEOUT_SECOND` | `300`       | Server read timeout (seconds)                            |
 | `CPPHTTPLIB_WEBSOCKET_CLOSE_TIMEOUT_SECOND` | `5`               | Timeout for waiting peer's Close response (seconds)      |
 | `CPPHTTPLIB_WEBSOCKET_PING_INTERVAL_SECOND` | `30`              | Automatic Ping interval for heartbeat (seconds)          |
 | `CPPHTTPLIB_WEBSOCKET_MAX_MISSED_PONGS`     | `0` (disabled)    | Close the connection after N consecutive unacked pings   |
@@ -390,7 +463,7 @@ The server side has the same `set_websocket_max_missed_pongs()`.
 
 With the default ping interval of 30 seconds, `max_missed_pongs = 2` detects a dead peer within ~60 seconds. The counter is reset every time a Pong frame is received, so the mechanism only works when your code is actively calling `read()` — exactly the pattern a normal WebSocket client already uses.
 
-**The default is `0`**, which means "never close the connection because of missing pongs." Pings are still sent on the heartbeat interval, but their responses are not checked. Even so, a dead connection does not linger forever: while your code is inside `read()`, `CPPHTTPLIB_WEBSOCKET_READ_TIMEOUT_SECOND` (default **300 seconds = 5 minutes**) acts as a backstop and `read()` fails if no frame arrives in time. `max_missed_pongs` is the knob for detecting an unresponsive peer faster than that 5-minute fallback.
+**The default is `0`**, which means "never close the connection because of missing pongs." Pings are still sent on the heartbeat interval, but their responses are not checked. On the server side a dead connection still does not linger: while a handler is inside `read()`, `CPPHTTPLIB_WEBSOCKET_SERVER_READ_TIMEOUT_SECOND` (default **300 seconds = 5 minutes**) acts as a backstop. A client has no such backstop — it waits forever unless you set a read timeout — so there `max_missed_pongs` is what notices an unresponsive peer at all. On either side it is also the knob for noticing one *faster* than the 5-minute fallback.
 
 ## Threading Model
 
@@ -409,6 +482,14 @@ svr.new_task_queue = [] {
 ```
 
 Choose sizes that account for both your expected HTTP load and the maximum number of simultaneous WebSocket connections.
+
+### Calling from Multiple Threads
+
+A single `WebSocket` (server-side) or `WebSocketClient` handle is shared by three potential callers: the thread running your handler (or holding the client), the heartbeat thread, and, if your code does its own thing, a separate thread calling `send()`/`close()` while another thread is blocked in `read()`.
+
+**Supported**: calling `read()` from one thread while calling `send()`/`close()` from another. This is the common pattern for a client that reads incoming messages in a loop on one thread and sends from elsewhere (e.g. a UI thread). A message that is in flight when `close()` is called still arrives intact; `close()` sends the Close frame and returns, leaving the connection's read side to the thread that owns it, so it does not block waiting for the peer's Close reply in that case. The heartbeat thread's automatic pings use the same `send()` path internally, so they are safe to run concurrently with your `read()` loop too — for `wss://` this requires every TLS call on a connection to be serialized internally, which cpp-httplib does for you.
+
+**Not supported**: calling `read()` from two threads at the same time on the same handle. The calls are serialized rather than left to corrupt each other, but which thread receives which message is unspecified, so there is nothing useful to build on it.
 
 ## Protocol
 
