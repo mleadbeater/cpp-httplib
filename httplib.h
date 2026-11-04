@@ -3079,6 +3079,7 @@ protected:
   std::atomic<bool> stop_requested_{false};
 
   std::atomic<size_t> tls_settings_version_{0};
+  size_t socket_tls_settings_version_ = 0;
 
   // Hostname to connection target map. The value is an IP literal or another
   // hostname; only the connection target changes, never the identity.
